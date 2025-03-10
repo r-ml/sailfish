@@ -210,27 +210,26 @@ fn derive_template_common_impl(
 
     std::fs::create_dir_all(output_file.parent().unwrap()).unwrap();
 
-    // This makes sure max 1 process creates a new file, "create_new" check+create is an
-    // atomic operation. Cargo sometimes runs multiple macro invocations for the same
-    // file in parallel, so that's important to prevent a race condition.
-    struct Lock<'path> {
-        path: &'path Path,
+    struct Lock {
+        file: std::fs::File,
     }
 
-    impl<'path> Lock<'path> {
-        fn new(path: &'path Path) -> std::io::Result<Self> {
-            std::fs::OpenOptions::new()
+    impl Lock {
+        fn new(path: &Path) -> std::io::Result<Self> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
                 .write(true)
-                .create_new(true)
-                .open(path)
-                .map(|_| Lock { path })
+                .create(true)
+                .truncate(false)
+                .open(path)?;
+            lockfile::LockFile::lock(&file)?;
+            Ok(Self { file })
         }
     }
 
-    impl<'path> Drop for Lock<'path> {
+    impl Drop for Lock {
         fn drop(&mut self) {
-            std::fs::remove_file(self.path)
-                .expect("Failed to clean up lock file {}. Delete it manually, or run `cargo clean`.");
+            lockfile::LockFile::unlock(&self.file).expect("Failed to unlock file");
         }
     }
 
@@ -288,24 +287,6 @@ fn derive_template_common_impl(
 
                 drop(lock);
                 Ok(report.deps)
-            }
-            // Lock file exists, template is already (currently being?) compiled.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let mut load_attempts = 0;
-                while lock_path.exists() {
-                    load_attempts += 1;
-                    if load_attempts > 100 {
-                        panic!("Lock file {:?} is stuck. Try deleting it.", lock_path);
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-
-                Ok(std::fs::read_to_string(&dep_path)
-                    .unwrap()
-                    .trim()
-                    .lines()
-                    .map(PathBuf::from)
-                    .collect())
             }
             Err(e) => panic!("{:?}: {}. Maybe try `cargo clean`?", lock_path, e),
         }
